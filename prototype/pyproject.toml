@@ -1,0 +1,14 @@
+[project]
+name = "prototype"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastf1>=3.8.3",
+    "lifelines>=0.30.3",
+    "matplotlib>=3.11.2",
+    "pandas>=2.3.3",
+    "scikit-learn>=1.9.1",
+    "xgboost>=3.2.0",
+]
