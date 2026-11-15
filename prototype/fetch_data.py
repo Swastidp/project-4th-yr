@@ -32,7 +32,21 @@ OUT_CSV = DATA_DIR / "laps_clean.csv"
 # Format: (year, event)
 # Event is what fastf1.get_session accepts.
 
+# Since Oct 2026 FastF1 (>= 3.9) needs an F1TV login for timing data,
+# so only races already in .fastf1_cache are usable. The other 2023
+# races and all of 2025 are blocked until a login is configured.
+
 RACES = [
+    (2022, "Bahrain"),
+    (2022, "Spain"),
+    (2022, "Silverstone"),
+    (2022, "Canada"),
+    (2022, "Monza"),
+    (2022, "Suzuka"),
+    # (2022, "Spielberg") excluded: broken source tyre data. 250 of 1,324 laps
+    # have no compound and 298 no tyre age, and FastF1 warns it had to fix
+    # incorrect tyre stint info for this race. Tyre data is what we model.
+    (2022, "Zandvoort"),  # Dutch GP
     (2024, "Bahrain"),  # dry, hot track
     (2024, "Spain"),  # dry
     (2024, "Silverstone"),  # wet/mixed
@@ -43,6 +57,84 @@ RACES = [
     (2024, "Spielberg"),  # dry (Austrian GP)
     (2024, "Zandvoort"),  # dry (Dutch GP)
 ]
+
+
+# What fastf1.get_session must resolve each event key to.
+# FastF1's fuzzy matching once silently loaded the wrong race.
+EXPECTED_EVENT_NAMES = {
+    "Bahrain": "Bahrain Grand Prix",
+    "Spain": "Spanish Grand Prix",
+    "Silverstone": "British Grand Prix",
+    "Canada": "Canadian Grand Prix",
+    "Monza": "Italian Grand Prix",
+    "Suzuka": "Japanese Grand Prix",
+    "Spielberg": "Austrian Grand Prix",
+    "Zandvoort": "Dutch Grand Prix",
+}
+
+
+# =========================================================
+# PIRELLI COMPOUND NOMINATIONS
+# =========================================================
+
+# FastF1 only gives weekend-relative labels (SOFT/MEDIUM/HARD).
+# This maps them to the real Pirelli compound for each race.
+# Covers more races than RACES so blocked races can be added later.
+
+PIRELLI_NOMINATIONS = {
+    (2022, "Bahrain"):     {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2022-bahrain-grand-prix.5nQGRrYUMcq8Y2BQeHBTeK
+    (2022, "Spain"):       {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://racingnews365.com/pirelli-confirm-tyre-compound-choices-for-upcoming-races
+    (2022, "Silverstone"): {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2022-british-grand-prix.5NSQn3DvP84qUkQIqltoxd
+    (2022, "Canada"):      {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2022-canadian-grand-prix.3fi2Bwiw5SHQIpsLC5iMNm
+    (2022, "Monza"):       {"HARD": "C2", "MEDIUM": "C3", "SOFT": "C4"},  # https://press.pirelli.com/2022-italian-grand-prix---preview-2/
+    (2022, "Suzuka"):      {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://racingnews365.com/pirelli-confirm-tyre-choices-for-return-of-singapore-and-japan
+    (2022, "Spielberg"):   {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://www.pitpass.com/72881/Pirelli-reveals-compounds-for-Austria-France-and-Hungary
+    (2022, "Zandvoort"):   {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/2022-dutch-grand-prix--preview/
+    (2023, "Bahrain"):     {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/pirelli-confirm-tyre-choices-for-first-three-f1-races-of-2023-as-new.1xlpcTVaLqw0NeM3aYoyCt
+    (2023, "Spain"):       {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/2023-tyre-compound-choices--monaco-and-spain/
+    (2023, "Silverstone"): {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/2023-tyre-compound-choices--canada-austria-and-great-britain/
+    (2023, "Canada"):      {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://press.pirelli.com/2023-tyre-compound-choices--canada-austria-and-great-britain/
+    (2023, "Monza"):       {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://press.pirelli.com/news-and-tyre-choices-for-zandvoort-and-monza/
+    (2023, "Suzuka"):      {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/unchanged-nominations-for-singapore-japan-and-qatar--in-name-at-least/
+    (2023, "Spielberg"):   {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://press.pirelli.com/2023-tyre-compound-choices--canada-austria-and-great-britain/
+    (2023, "Zandvoort"):   {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/news-and-tyre-choices-for-zandvoort-and-monza/
+    (2024, "Bahrain"):     {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/pirelli-nominates-the-compounds-for-the-start-of-2024/
+    (2024, "Spain"):       {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2024-spanish-grand-prix.7rLCqBvroeRw7HVW8GGChP
+    (2024, "Silverstone"): {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2024-british-grand-prix.3vzK0q1kbEOjzwGClOCXoF
+    (2024, "Canada"):      {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://tyrepress.com/2024/04/pirelli-sticks-with-softest-f1-tyre-compound-trio-for-three-more-grands-prix
+    (2024, "Monza"):       {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2024-italian-grand-prix.2oO1jaVl2vB25F16qcFMPH
+    (2024, "Suzuka"):      {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2024-japanese-grand-prix.0dan38YDF6LLdAHyNuhJX
+    (2024, "Spielberg"):   {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2024-austrian-grand-prix.501nkNqLI40inoC4Tdf4w6
+    (2024, "Zandvoort"):   {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/all-compounds-on-track-over-next-three-races/
+    (2025, "Bahrain"):     {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2025-bahrain-grand-prix.7gnHbNpm0OJQIjPqsWoyof
+    (2025, "Spain"):       {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/from-monaco-to-montreal-all-the-compounds-in-play/
+    (2025, "Silverstone"): {"HARD": "C2", "MEDIUM": "C3", "SOFT": "C4"},  # https://press.pirelli.com/both-new-and-familiar-for-spielberg-to-budapest/
+    (2025, "Canada"):      {"HARD": "C4", "MEDIUM": "C5", "SOFT": "C6"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2025-canadian-grand-prix.6f3pKs15OHHlxe7uI544kO
+    (2025, "Monza"):       {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2025-italian-grand-prix.7fO9Z1g1aG6QUGhXzg8gLU
+    (2025, "Suzuka"):      {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://scuderiafans.com/pirelli-reveals-tire-compounds-for-first-five-races-of-2025-f1-season/
+    (2025, "Spielberg"):   {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://press.pirelli.com/both-new-and-familiar-for-spielberg-to-budapest/
+    (2025, "Zandvoort"):   {"HARD": "C2", "MEDIUM": "C3", "SOFT": "C4"},  # https://www.pitpass.com/80783/Pirelli-reveals-compounds-for-remaining-races
+}
+
+
+def compound_code(year, event, compound):
+    """
+    Return a Pirelli code comparable across years ("C0".."C6"),
+    or None for INTERMEDIATE/WET or an unknown race.
+    """
+
+    code = PIRELLI_NOMINATIONS.get((year, event), {}).get(compound)
+
+    if code is None:
+        return None
+
+    # In 2023 Pirelli renamed the old C1 to C0 (a new C1 sits between them).
+    if year == 2022 and code == "C1":
+        return "C0"
+
+    # ponytail: 2025 also changed compounds; no 2025 race is in RACES yet,
+    # so 2025 codes may need their own mapping when those races are added.
+    return code
 
 
 # =========================================================
@@ -184,6 +276,9 @@ def load_race(year, event):
 
     laps = laps[laps["LapTime"] < 1.05 * median]
 
+    # Laps without a compound or tyre age can't be used by any tyre model.
+    laps = laps.dropna(subset=["Compound", "TyreLife"])
+
     after_f3 = len(laps)
 
     # -----------------------------------------------------
@@ -206,9 +301,20 @@ def load_race(year, event):
 
     resolved = session.event["EventName"]
 
+    expected = EXPECTED_EVENT_NAMES[event]
+
+    if resolved != expected:
+        raise ValueError(
+            f"FastF1 resolved {year} {event!r} to {resolved!r}, expected {expected!r}"
+        )
+
     laps.insert(0, "Event", resolved)
 
     laps.insert(0, "Year", year)
+
+    laps["CCode"] = [
+        compound_code(year, event, compound) for compound in laps["Compound"]
+    ]
 
     return (laps, (resolved, raw, after_f1, after_f2, after_f3))
 
@@ -233,6 +339,16 @@ def main():
     # -----------------------------------------------------
 
     fastf1.Cache.enable_cache(str(CACHE_DIR))
+
+    missing_nominations = [race for race in RACES if race not in PIRELLI_NOMINATIONS]
+
+    assert not missing_nominations, (
+        f"RACES without a PIRELLI_NOMINATIONS entry: {missing_nominations}"
+    )
+
+    assert compound_code(2022, "Bahrain", "HARD") == "C0"  # old C1 renamed
+    assert compound_code(2024, "Bahrain", "HARD") == "C1"
+    assert compound_code(2024, "Bahrain", "INTERMEDIATE") is None
 
     frames = []
     stats = []
@@ -333,7 +449,15 @@ def main():
     # VALIDATION
     # =====================================================
 
-    needed = ["Compound", "TyreLife", "LapTimeSeconds", "Driver", "Year", "Event"]
+    needed = [
+        "Compound",
+        "CCode",
+        "TyreLife",
+        "LapTimeSeconds",
+        "Driver",
+        "Year",
+        "Event",
+    ]
 
     assert not combined.empty, "no laps survived across all races"
 

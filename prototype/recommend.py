@@ -18,7 +18,7 @@ Important limitations:
     - PIT_LOSS_S is a domain assumption, not learned from the data.
     - Track temperature is not used in the recommendation cost.
     - Circuit-specific compound effects cannot be reliably separated
-      with the current small 9-race dataset.
+      with the current 16-race dataset.
     - Rainfall currently routes to INTERMEDIATE by rule rather than
       through a trained wet-tyre model.
 
@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 
 from build_stints import km_table
+from fetch_data import compound_code
 from train_pace_loss import (
     IN_CSV,
     add_features,
@@ -107,7 +108,7 @@ def load_laps():
 # =========================================================
 
 
-def fit_ridge(df=None):
+def fit_ridge(df=None, key="Compound"):
     """
     Refit the Stage-1 Ridge model on the complete
     available cleaned lap dataset.
@@ -119,12 +120,15 @@ def fit_ridge(df=None):
     but it is deliberately held at zero in the
     recommendation prediction design so the recommender
     does not claim to be track-temperature aware.
+
+    key="TyreKey" fits on Pirelli codes instead of weekend labels;
+    the returned "compounds" are then the codes.
     """
 
     if df is None:
         df = load_laps()
 
-    compounds = sorted(df["Compound"].dropna().unique().tolist())
+    compounds = sorted(df[key].dropna().unique().tolist())
 
     if not compounds:
         raise RuntimeError("No compounds available for Ridge fitting.")
@@ -132,6 +136,7 @@ def fit_ridge(df=None):
     X = ridge_design(
         df,
         compounds,
+        key=key,
     )
 
     y = df["Delta"].astype(float)
@@ -167,6 +172,7 @@ def fit_ridge(df=None):
 def recommendation_design(
     df,
     compounds,
+    key="Compound",
 ):
     """
     Build the Ridge design used by the recommender.
@@ -179,6 +185,7 @@ def recommendation_design(
     X = ridge_design(
         df.assign(TrackTemp=0.0),
         compounds,
+        key=key,
     )
 
     return X.drop(columns=["TrackTemp"])
@@ -242,6 +249,7 @@ def fitted(
     compound,
     ages,
     fuel,
+    key="Compound",
 ):
     """
     Predict pace loss for one compound over a sequence
@@ -270,7 +278,7 @@ def fitted(
     grid = pd.DataFrame(
         {
             "TyreLife": ages,
-            "Compound": compound,
+            key: compound,
             "FuelPct": fuel,
             "TrackTemp": 0.0,
         }
@@ -279,6 +287,7 @@ def fitted(
     X = recommendation_design(
         grid,
         compounds,
+        key=key,
     )
 
     return model.predict(X)
@@ -296,6 +305,7 @@ def cumulative_loss(
     current_lap,
     total_race_laps,
     max_stint,
+    key="Compound",
 ):
     """
     Calculate cumulative predicted pace loss for
@@ -326,6 +336,7 @@ def cumulative_loss(
         compound,
         ages,
         fuel,
+        key=key,
     )
 
     return np.cumsum(predictions)
@@ -342,6 +353,8 @@ def cost_table(
     medians,
     current_lap,
     total_race_laps,
+    key="Compound",
+    nomination=None,
 ):
     """
     Calculate every compound/stint-length combination.
@@ -351,6 +364,10 @@ def cost_table(
     Cost =
         cumulative predicted pace-loss burden
         + PIT_LOSS_S * R / L
+
+    nomination (label -> Pirelli code, e.g. {"SOFT": "C3", ...})
+    predicts each dry label with its code, for a model fitted
+    with key="TyreKey". KM medians stay label-based.
     """
 
     if total_race_laps <= current_lap:
@@ -371,16 +388,31 @@ def cost_table(
     rows = []
 
     for compound in DRY:
-        if compound not in compounds:
+        if nomination is None:
+            tyre = compound
+        else:
+            tyre = nomination.get(compound)
+
+            if tyre is None:
+                continue
+
+            if tyre not in compounds:
+                raise ValueError(
+                    f"nominated {compound} = {tyre} is not a key of the fitted "
+                    f"model (keys: {', '.join(compounds)})"
+                )
+
+        if tyre not in compounds:
             continue
 
         cumulative = cumulative_loss(
             model,
             compounds,
-            compound,
+            tyre,
             current_lap,
             total_race_laps,
             max_stint,
+            key=key,
         )
 
         median = medians.get(
@@ -406,17 +438,20 @@ def cost_table(
             else:
                 flag = "KM median unavailable"
 
-            rows.append(
-                {
-                    "compound": compound,
-                    "stint_laps": stint_laps,
-                    "deg_cost": degradation_cost,
-                    "pit_cost": pit_cost,
-                    "cost": total_cost,
-                    "km_median": median,
-                    "flag": flag,
-                }
-            )
+            row = {
+                "compound": compound,
+                "stint_laps": stint_laps,
+                "deg_cost": degradation_cost,
+                "pit_cost": pit_cost,
+                "cost": total_cost,
+                "km_median": median,
+                "flag": flag,
+            }
+
+            if nomination is not None:
+                row["code"] = tyre
+
+            rows.append(row)
 
     if not rows:
         return pd.DataFrame(
@@ -446,6 +481,8 @@ def recommend(
     compounds_available=DRY,
     _fit=None,
     _medians=None,
+    key="Compound",
+    nomination=None,
 ):
     """
     Return ranked dry compound/stint-length options.
@@ -475,7 +512,7 @@ def recommend(
 
     if _fit is None:
         df = load_laps()
-        fit = fit_ridge(df)
+        fit = fit_ridge(df, key=key)
     else:
         fit = _fit
 
@@ -486,22 +523,25 @@ def recommend(
     else:
         medians = _medians
 
-    available = [
-        compound
-        for compound in compounds_available
-        if compound in DRY and compound in compounds
-    ]
-
-    if not available:
-        raise ValueError("No valid dry compounds are available for recommendation.")
-
     table = cost_table(
         model,
         compounds,
         medians,
         current_lap,
         total_race_laps,
+        key=key,
+        nomination=nomination,
     )
+
+    # cost_table only returns dry labels the model can predict.
+    available = [
+        compound
+        for compound in compounds_available
+        if compound in DRY and compound in set(table["compound"])
+    ]
+
+    if not available:
+        raise ValueError("No valid dry compounds are available for recommendation.")
 
     table = table[table["compound"].isin(available)].copy()
 
@@ -880,6 +920,53 @@ def main():
     passed = sum(ok for _, ok in checks)
 
     print(f"{passed}/{len(checks)} checks passed")
+
+    # -----------------------------------------------------
+    # Same scenarios with the Pirelli-code model
+    # -----------------------------------------------------
+
+    fit_code = fit_ridge(df, key="TyreKey")
+
+    nomination = {label: compound_code(2024, "Bahrain", label) for label in DRY}
+
+    nomination_text = " ".join(f"{label}={code}" for label, code in nomination.items())
+
+    early_code = recommend(
+        current_lap=5,
+        total_race_laps=57,
+        rainfall=False,
+        _fit=fit_code,
+        _medians=medians,
+        key="TyreKey",
+        nomination=nomination,
+    )
+
+    late_code = recommend(
+        current_lap=45,
+        total_race_laps=57,
+        rainfall=False,
+        _fit=fit_code,
+        _medians=medians,
+        key="TyreKey",
+        nomination=nomination,
+    )
+
+    show(
+        f"C-code model, Scenario 1: lap 5 of 57 (2024 Bahrain: {nomination_text})",
+        early_code,
+    )
+
+    show(
+        f"C-code model, Scenario 2: lap 45 of 57 (2024 Bahrain: {nomination_text})",
+        late_code,
+    )
+
+    print(
+        "\n[INFO] top pick with 12 laps left: "
+        f"label model {late.iloc[0]['compound']} L={late.iloc[0]['stint_laps']:.0f}, "
+        f"C-code model {late_code.iloc[0]['compound']} "
+        f"({late_code.iloc[0]['code']}) L={late_code.iloc[0]['stint_laps']:.0f}"
+    )
 
     print("\nLimitations:")
 

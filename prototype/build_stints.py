@@ -720,10 +720,13 @@ def main():
 
     counts = stints["Compound"].value_counts()
 
+    # Only compounds with a dummy column below (or the HARD baseline)
+    # can enter the fit; anything else would silently count as HARD.
     keep = [
         compound
         for compound in compounds
-        if counts[compound] >= MIN_STINTS_FOR_COX or compound == "HARD"
+        if compound in {"HARD", "MEDIUM", "SOFT", "INTERMEDIATE"}
+        and (counts[compound] >= MIN_STINTS_FOR_COX or compound == "HARD")
     ]
 
     dropped = [
@@ -750,7 +753,7 @@ def main():
         "excluded from the fit: "
         + (", ".join(dropped) if dropped else "nothing")
         + f" "
-        f"(threshold: <{MIN_STINTS_FOR_COX} stints)"
+        f"(threshold: <{MIN_STINTS_FOR_COX} stints, or no dummy column)"
     )
 
     # -----------------------------------------------------

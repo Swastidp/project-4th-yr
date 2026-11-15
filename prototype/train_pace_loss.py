@@ -71,6 +71,10 @@ def add_features(df):
 
     Race:
         Unique race identifier used for grouped validation.
+
+    TyreKey:
+        Pirelli code (C0..C6) where known, else the FastF1 label,
+        so INTERMEDIATE/WET keep their own key.
     """
 
     df = df.copy()
@@ -85,6 +89,8 @@ def add_features(df):
 
     df["Race"] = df["Year"].astype(str) + "_" + df["Event"].astype(str)
 
+    df["TyreKey"] = df["CCode"].fillna(df["Compound"])
+
     return df
 
 
@@ -93,7 +99,7 @@ def add_features(df):
 # =========================================================
 
 
-def ridge_design(df, compounds):
+def ridge_design(df, compounds, key="Compound"):
     """
     Build the explicit Ridge design matrix.
 
@@ -108,12 +114,15 @@ def ridge_design(df, compounds):
 
     age^2 is scaled by 100 to keep the feature numerically
     well behaved while retaining interpretability.
+
+    key picks the tyre column: "Compound" (weekend label) or
+    "TyreKey" (Pirelli code).
     """
 
     X = pd.DataFrame(index=df.index)
 
     for compound in compounds:
-        is_compound = (df["Compound"] == compound).astype(float)
+        is_compound = (df[key] == compound).astype(float)
 
         X[f"int[{compound}]"] = is_compound
 
@@ -558,6 +567,16 @@ def main():
         compounds,
     )
 
+    tyre_keys = sorted(df["TyreKey"].dropna().unique().tolist())
+
+    print("laps per tyre key:\n" + df["TyreKey"].value_counts().to_string())
+
+    X_ridge_code = ridge_design(
+        df,
+        tyre_keys,
+        key="TyreKey",
+    )
+
     xgb_input = df[XGB_FEATURES + ["Compound"]]
 
     X_xgb = pd.get_dummies(
@@ -569,6 +588,7 @@ def main():
     # Make sure all required values are valid.
     for name, X in (
         ("ridge", X_ridge),
+        ("ridge c-code", X_ridge_code),
         ("xgb", X_xgb),
     ):
         bad_columns = X.columns[X.isna().any()].tolist()
@@ -630,6 +650,11 @@ def main():
                 make_ridge,
             ),
             (
+                "Ridge (C-code)",
+                X_ridge_code,
+                make_ridge,
+            ),
+            (
                 "XGBoost",
                 X_xgb,
                 make_xgb,
@@ -649,6 +674,13 @@ def main():
                 f"{name}, {view}",
                 folds,
             )
+
+    if ("Ridge", "dry only") in means and ("Ridge (C-code)", "dry only") in means:
+        print(
+            "\ndry-only MAE: "
+            f"Ridge (label) {means[('Ridge', 'dry only')]['mae']:.3f}  vs  "
+            f"Ridge (C-code) {means[('Ridge (C-code)', 'dry only')]['mae']:.3f}"
+        )
 
     # =====================================================
     # 5. FULL-DATA RIDGE REFIT
