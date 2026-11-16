@@ -1,207 +1,627 @@
-"""
-Stage-1 pace-loss model: predict lap delta vs the driver's own best lap
-in that race.
-
-Two models on the same target:
-    - Ridge with an explicit per-compound specification, for interpretation.
-    - XGBoost, for predictive accuracy.
-
-Both are evaluated using GroupKFold by race (Year + Event), so
-no race appears in both training and testing.
-
-FuelPct is used to separate fuel-burn effects from tyre-age effects.
-
-Run:
-    uv run train_pace_loss.py
-"""
-
 from pathlib import Path
 
-import matplotlib
+import warnings
+
 import numpy as np
+
 import pandas as pd
 
-matplotlib.use("Agg")
+from sklearn.impute import SimpleImputer
 
-import matplotlib.pyplot as plt
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import HuberRegressor
+
 from sklearn.metrics import mean_absolute_error, r2_score
+
 from sklearn.model_selection import GroupKFold
-from xgboost import XGBRegressor
 
+from sklearn.pipeline import Pipeline
 
 # =========================================================
-# PATHS / SETTINGS
+
+# SETTINGS
+
 # =========================================================
 
-DATA_DIR = Path(__file__).parent / "data"
+BASE_DIR = Path(__file__).resolve().parent
 
-IN_CSV = DATA_DIR / "laps_clean.csv"
-OUT_PNG = DATA_DIR / "degradation_curve_corrected.png"
+DATA_DIR = BASE_DIR / "training_data_tif1"
 
-MIN_LAPS = 20
+TRAINING_YEARS = [2022, 2023, 2024, 2025]
 
-XGB_FEATURES = [
+DRY_COMPOUNDS = ["HARD", "MEDIUM", "SOFT"]
+
+BASELINE_START_INDEX = 2  # Zero-based index: stint lap 3*
+
+BASELINE_LAPS = 7  # Stint laps 3–9 inclusive*
+
+PREDICTION_START_INDEX = 9  # Zero-based index: predictions start at lap 10*
+
+MIN_STINT_LAPS = 10
+
+HUBER_EPSILON = 1.35
+HUBER_ALPHA = 1.0
+HUBER_MAX_ITER = 500
+
+CV_SPLITS = 5
+
+MAX_SUPPORTED_AGE_PERCENTILE = 98
+
+REQUIRED_COLUMNS = [
+    "Year",
+    "Event",
+    "Driver",
+    "Stint",
+    "LapNumber",
+    "LapTimeSeconds",
     "TyreLife",
-    "FuelPct",
-    "TrackTemp",
-    "AirTemp",
-    "Humidity",
+    "Compound",
+    "Rainfall",
 ]
 
-# A race is treated as a separate wet regime when rainfall
-# is present on more than 10% of its clean laps.
-WET_FRACTION = 0.10
-
-
 # =========================================================
-# FEATURE ENGINEERING
+
+# WEATHER CLASSIFICATION
+
 # =========================================================
 
 
-def add_features(df):
-    """
-    Create the modelling target and fuel-load correction.
-
-    Delta:
-        Lap time minus the driver's own best lap in that race.
-
-    FuelPct:
-        1 - LapNumber / race total laps.
-
-    Race:
-        Unique race identifier used for grouped validation.
-
-    TyreKey:
-        Pirelli code (C0..C6) where known, else the FastF1 label,
-        so INTERMEDIATE/WET keep their own key.
+def classify_rainfall(value):
     """
 
-    df = df.copy()
+    True  = wet
 
-    best = df.groupby(["Year", "Event", "Driver"])["LapTimeSeconds"].transform("min")
+    False = dry
 
-    df["Delta"] = df["LapTimeSeconds"] - best
+    None  = unknown
 
-    total_laps = df.groupby(["Year", "Event"])["LapNumber"].transform("max")
+    """
 
-    df["FuelPct"] = 1.0 - df["LapNumber"] / total_laps
+    if pd.isna(value):
+        return None
 
-    df["Race"] = df["Year"].astype(str) + "_" + df["Event"].astype(str)
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
 
-    df["TyreKey"] = df["CCode"].fillna(df["Compound"])
+    value = str(value).strip().lower()
+
+    if value in ["true", "1", "yes"]:
+        return True
+
+    if value in ["false", "0", "no"]:
+        return False
+
+    return None
+
+
+def classify_stint_weather(values):
+    """
+
+    A stint is dry only if every recorded lap is explicitly dry.
+
+    """
+
+    statuses = [classify_rainfall(value) for value in values]
+
+    if True in statuses:
+        return "wet"
+
+    if None in statuses:
+        return "unknown"
+
+    return "dry"
+
+
+# =========================================================
+
+# LOAD PARQUET DATASET
+
+# =========================================================
+
+
+def load_training_data():
+
+    if not DATA_DIR.exists():
+        raise FileNotFoundError(f"Training data directory not found: {DATA_DIR}")
+
+    files = sorted(DATA_DIR.glob("*.parquet"))
+
+    if not files:
+        raise FileNotFoundError(f"No Parquet files found in {DATA_DIR}")
+
+    print("\n" + "=" * 75)
+
+    print("LOADING HISTORICAL F1 TRAINING DATA")
+
+    print("=" * 75)
+
+    print(f"Dataset directory: {DATA_DIR}")
+
+    print(f"Parquet files found: {len(files)}")
+
+    frames = []
+
+    failed_files = []
+
+    for index, file in enumerate(files, start=1):
+        try:
+            frame = pd.read_parquet(file, engine="pyarrow")
+
+            if frame.empty:
+                failed_files.append((file.name, "Empty Parquet file"))
+
+                continue
+
+            frames.append(frame)
+
+        except Exception as error:
+            failed_files.append((file.name, str(error)))
+
+        if index % 15 == 0 or index == len(files):
+            print(
+                f"Loaded {index}/{len(files)} files",
+                flush=True,
+            )
+
+    if not frames:
+        raise RuntimeError("No usable Parquet files could be loaded.")
+
+    data = pd.concat(
+        frames,
+        ignore_index=True,
+    )
+
+    missing = [column for column in REQUIRED_COLUMNS if column not in data.columns]
+
+    if missing:
+        raise ValueError(f"Training dataset missing columns: {missing}")
+
+    # Verify unique race identity.
+
+    data["Year"] = pd.to_numeric(
+        data["Year"],
+        errors="coerce",
+    )
+
+    data = data.dropna(subset=["Year", "Event"]).copy()
+
+    data["Year"] = data["Year"].astype(int)
+
+    data = data[data["Year"].isin(TRAINING_YEARS)].copy()
+
+    # Build a unique race identifier.
+
+    data["Race"] = data["Year"].astype(str) + "_" + data["Event"].astype(str)
+
+    race_count = data["Race"].nunique()
+
+    print("\nDATASET SUMMARY")
+
+    print("-" * 75)
+
+    print(f"Successfully loaded files: {len(frames)}")
+
+    print(f"Failed files:              {len(failed_files)}")
+
+    print(f"Unique races:              {race_count}")
+
+    print(f"Total lap records:         {len(data):,}")
+
+    print("\nSEASON BREAKDOWN")
+
+    for year in TRAINING_YEARS:
+        season = data[data["Year"] == year]
+
+        print(f"{year}: {season['Event'].nunique()} races | {len(season):,} laps")
+
+    print("\nCOMPOUND DISTRIBUTION")
+
+    print(data["Compound"].value_counts().to_string())
+
+    if failed_files:
+        print("\nFILES THAT COULD NOT BE LOADED")
+
+        for filename, reason in failed_files:
+            print(f"{filename}: {reason}")
+
+    if race_count < CV_SPLITS:
+        raise ValueError(
+            f"Only {race_count} races available. At least {CV_SPLITS} are required."
+        )
+
+    return data
+
+
+# =========================================================
+
+# DATA PREPARATION
+
+# =========================================================
+
+
+def prepare_data(data):
+
+    df = data.copy()
+
+    # -----------------------------------------------------
+
+    # NUMERIC CONVERSION
+
+    # -----------------------------------------------------
+
+    numeric_columns = [
+        "Year",
+        "Stint",
+        "LapNumber",
+        "LapTimeSeconds",
+        "TyreLife",
+    ]
+
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+    df["Compound"] = df["Compound"].astype("string").str.upper().str.strip()
+
+    # -----------------------------------------------------
+
+    # VALIDATION
+
+    # -----------------------------------------------------
+
+    df = df.dropna(
+        subset=[
+            "Year",
+            "Event",
+            "Driver",
+            "Stint",
+            "LapNumber",
+            "LapTimeSeconds",
+            "TyreLife",
+            "Compound",
+        ]
+    ).copy()
+
+    df = df[
+        (df["LapTimeSeconds"] > 0)
+        & (df["LapNumber"] > 0)
+        & (df["TyreLife"] > 0)
+        & (df["Stint"] > 0)
+    ].copy()
+
+    # -----------------------------------------------------
+
+    # COMPOUND FILTER
+
+    # -----------------------------------------------------
+
+    before_compound = len(df)
+
+    df = df[df["Compound"].isin(DRY_COMPOUNDS)].copy()
+
+    excluded_compound = before_compound - len(df)
+
+    if df.empty:
+        raise ValueError("No HARD, MEDIUM or SOFT laps available.")
+
+    # -----------------------------------------------------
+
+    # IDENTIFY ORIGINAL STINTS
+
+    # -----------------------------------------------------
+
+    df["Race"] = df["Year"].astype(int).astype(str) + "_" + df["Event"].astype(str)
+
+    df["StintGroup"] = (
+        df["Race"]
+        + "_"
+        + df["Driver"].astype(str)
+        + "_"
+        + df["Stint"].astype(int).astype(str)
+    )
+
+    # -----------------------------------------------------
+
+    # WHOLE-STINT WEATHER FILTER
+
+    # -----------------------------------------------------
+
+    weather_status = df.groupby("StintGroup")["Rainfall"].apply(classify_stint_weather)
+
+    wet_stints = set(weather_status[weather_status == "wet"].index)
+
+    unknown_stints = set(weather_status[weather_status == "unknown"].index)
+
+    dry_stints = set(weather_status[weather_status == "dry"].index)
+
+    before_weather = len(df)
+
+    df = df[df["StintGroup"].isin(dry_stints)].copy()
+
+    excluded_weather_laps = before_weather - len(df)
+
+    if df.empty:
+        raise ValueError("No fully dry stints remain.")
+
+    # -----------------------------------------------------
+
+    # CHECK STINT COMPOUND CONSISTENCY
+
+    # -----------------------------------------------------
+
+    mixed = df.groupby("StintGroup")["Compound"].nunique()
+
+    if (mixed > 1).any():
+        raise ValueError("Some original stints contain multiple compounds.")
+
+    # -----------------------------------------------------
+
+    # SORT
+
+    # -----------------------------------------------------
+
+    df = df.sort_values(
+        [
+            "Year",
+            "Event",
+            "Driver",
+            "Stint",
+            "LapNumber",
+        ]
+    ).reset_index(drop=True)
+
+    # -----------------------------------------------------
+
+    # CLEANING SUMMARY
+
+    # -----------------------------------------------------
+
+    print("\nDATA CLEANING SUMMARY")
+
+    print("-" * 75)
+
+    actual_years = sorted(df["Year"].dropna().astype(int).unique().tolist())
+    print(f"Training seasons:               {actual_years}")
+
+    print(f"Non-dry compound laps excluded: {excluded_compound:,}")
+
+    print(f"Wet stints excluded:            {len(wet_stints):,}")
+
+    print(f"Unknown-weather stints excluded:{len(unknown_stints):,}")
+
+    print(f"Laps removed by weather filter: {excluded_weather_laps:,}")
+
+    print(f"Fully dry stints retained:      {len(dry_stints):,}")
+
+    print(f"Remaining dry training laps:    {len(df):,}")
+
+    print(f"Remaining races:                {df['Race'].nunique()}")
+
+    print("\nSEASON BREAKDOWN")
+
+    for year in actual_years:
+        season = df[df["Year"] == year]
+
+        print(f"{year}: {season['Event'].nunique()} races | {len(season):,} laps")
+
+    print("\nCOMPOUNDS")
+
+    print(df["Compound"].value_counts().to_string())
 
     return df
 
 
 # =========================================================
-# RIDGE DESIGN
-# =========================================================
 
-
-def ridge_design(df, compounds, key="Compound"):
-    """
-    Build the explicit Ridge design matrix.
-
-    Model structure:
-
-        Delta =
-            compound intercept
-            + compound-specific age effect
-            + compound-specific age^2 effect
-            + shared FuelPct effect
-            + shared TrackTemp effect
-
-    age^2 is scaled by 100 to keep the feature numerically
-    well behaved while retaining interpretability.
-
-    key picks the tyre column: "Compound" (weekend label) or
-    "TyreKey" (Pirelli code).
-    """
-
-    X = pd.DataFrame(index=df.index)
-
-    for compound in compounds:
-        is_compound = (df[key] == compound).astype(float)
-
-        X[f"int[{compound}]"] = is_compound
-
-        X[f"age[{compound}]"] = is_compound * df["TyreLife"]
-
-        X[f"age2[{compound}]"] = is_compound * df["TyreLife"] ** 2 / 100.0
-
-    X["FuelPct"] = df["FuelPct"]
-    X["TrackTemp"] = df["TrackTemp"]
-
-    return X
-
-
-def make_ridge():
-    """
-    Ridge with no global intercept because the compound
-    dummy columns provide the compound-specific intercepts.
-    """
-
-    return Ridge(
-        alpha=1.0,
-        fit_intercept=False,
-    )
-
+# BUILD STINT TARGETS
 
 # =========================================================
-# XGBOOST
-# =========================================================
 
 
-def make_xgb():
-    """
-    XGBoost regression model used for comparison.
-    """
-
-    return XGBRegressor(
-        n_estimators=400,
-        max_depth=5,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=0,
-        n_jobs=4,
-    )
-
-
-# =========================================================
-# GROUPED CROSS-VALIDATION
-# =========================================================
-
-
-def cv_scores(X, y, groups, make_model):
-    """
-    Evaluate a model using race-grouped cross-validation.
-
-    Each race is held out as a complete test group.
-
-    Returns:
-        Per-race MAE, R² and median baseline metrics.
-    """
-
-    groups = pd.Series(
-        groups,
-        index=X.index,
-    )
-
-    unique_groups = groups.nunique()
-
-    if unique_groups < 2:
-        raise ValueError("At least two race groups are required for GroupKFold.")
+def build_stint_targets(df):
 
     rows = []
 
-    splitter = GroupKFold(n_splits=unique_groups)
+    excluded_short = 0
 
-    for train_idx, test_idx in splitter.split(
-        X,
-        y,
-        groups,
+    excluded_gaps = 0
+
+    excluded_invalid_baselines = 0
+
+    # Maximum race lap for each event.
+
+    race_lengths = df.groupby("Race")["LapNumber"].max().to_dict()
+
+    group_columns = [
+        "Year",
+        "Event",
+        "Driver",
+        "Stint",
+        "StintGroup",
+        "Race",
+        "Compound",
+    ]
+
+    for _, stint in df.groupby(group_columns, sort=False):
+        stint = stint.sort_values("LapNumber").copy()
+
+        if len(stint) < MIN_STINT_LAPS:
+            excluded_short += 1
+
+            continue
+
+        # The baseline requires the first nine stint laps to be consecutive.
+
+        first_nine_laps = stint["LapNumber"].iloc[:PREDICTION_START_INDEX].to_numpy()
+
+        if len(first_nine_laps) < PREDICTION_START_INDEX or not np.all(
+            np.diff(first_nine_laps) == 1
+        ):
+            excluded_gaps += 1
+
+            continue
+
+        # Use the median of stint laps 3–9 as the seven-lap baseline.
+
+        baseline_rows = stint.iloc[
+            BASELINE_START_INDEX : BASELINE_START_INDEX + BASELINE_LAPS
+        ]
+
+        baseline_time = float(baseline_rows["LapTimeSeconds"].median())
+
+        if not np.isfinite(baseline_time) or baseline_time <= 0:
+            excluded_invalid_baselines += 1
+
+            continue
+
+        starting_age = float(stint["TyreLife"].iloc[0])
+
+        race_length = race_lengths[stint["Race"].iloc[0]]
+
+        for _, lap in stint.iloc[PREDICTION_START_INDEX:].iterrows():
+            age = float(lap["TyreLife"]) - starting_age
+
+            if age <= 0:
+                continue
+
+            lap_number = float(lap["LapNumber"])
+
+            rows.append(
+                {
+                    "Race": lap["Race"],
+                    "Year": int(lap["Year"]),
+                    "Event": lap["Event"],
+                    "Driver": lap["Driver"],
+                    "Compound": lap["Compound"],
+                    "StintGroup": lap["StintGroup"],
+                    "StintAge": age,
+                    "LapNumber": lap_number,
+                    "RaceProgress": lap_number / race_length,
+                    "Delta": float(lap["LapTimeSeconds"]) - baseline_time,
+                }
+            )
+
+    result = pd.DataFrame(rows)
+
+    if result.empty:
+        raise ValueError("No usable stint targets were generated.")
+
+    print("\nSTINT PREPARATION")
+
+    print("-" * 75)
+
+    print("Baseline: median of stint laps 3–9 (7 laps)")
+
+    print("Prediction starts: stint lap 10 onward")
+
+    print(f"Stints found:                  {df['StintGroup'].nunique():,}")
+
+    print(f"Short stints excluded:         {excluded_short:,}")
+
+    print(f"Stints with baseline gaps:     {excluded_gaps:,}")
+
+    print(f"Invalid baselines excluded:    {excluded_invalid_baselines:,}")
+
+    print(f"Training samples:              {len(result):,}")
+
+    return result
+
+
+# =========================================================
+
+# FEATURE ENGINEERING
+
+# =========================================================
+
+
+def build_features(df, compounds):
+
+    X = pd.DataFrame(index=df.index)
+
+    age = df["StintAge"]
+
+    for compound in compounds:
+        mask = (df["Compound"] == compound).astype(float)
+
+        X[f"age_{compound}"] = mask * age
+
+        X[f"age2_{compound}"] = mask * age.pow(2) / 100.0
+
+    # Control for race progress, including nonlinear effects.
+
+    progress = df["RaceProgress"].clip(0, 1)
+
+    X["RaceProgress"] = progress
+
+    X["RaceProgress2"] = progress.pow(2)
+
+    return X.astype(float)
+
+
+# =========================================================
+
+# MODEL
+
+# =========================================================
+
+
+def make_model():
+
+    return Pipeline(
+        [
+            (
+                "imputer",
+                SimpleImputer(
+                    strategy="median",
+                ),
+            ),
+            (
+                "huber",
+                HuberRegressor(
+                    epsilon=HUBER_EPSILON,
+                    alpha=HUBER_ALPHA,
+                    max_iter=HUBER_MAX_ITER,
+                    fit_intercept=False,
+                ),
+            ),
+        ]
+    )
+
+
+# =========================================================
+
+# RACE-GROUPED VALIDATION
+
+# =========================================================
+
+
+def validate_model(df, X, y):
+
+    races = df["Race"]
+
+    n_splits = min(
+        CV_SPLITS,
+        races.nunique(),
+    )
+
+    if n_splits < 2:
+        raise ValueError("At least two races are required.")
+
+    splitter = GroupKFold(
+        n_splits=n_splits,
+    )
+
+    predictions = np.full(
+        len(df),
+        np.nan,
+    )
+
+    folds = []
+
+    for fold, (train_idx, test_idx) in enumerate(
+        splitter.split(X, y, races),
+        start=1,
     ):
         model = make_model()
 
@@ -210,623 +630,427 @@ def cv_scores(X, y, groups, make_model):
             y.iloc[train_idx],
         )
 
-        predictions = model.predict(X.iloc[test_idx])
+        pred = model.predict(X.iloc[test_idx])
 
-        baseline = np.full(
-            len(test_idx),
-            y.iloc[train_idx].median(),
-        )
+        predictions[test_idx] = pred
 
-        rows.append(
+        folds.append(
             {
-                "race": groups.iloc[test_idx].iloc[0],
-                "mae": mean_absolute_error(
+                "Fold": fold,
+                "Races": races.iloc[test_idx].nunique(),
+                "Laps": len(test_idx),
+                "MAE": mean_absolute_error(
                     y.iloc[test_idx],
-                    predictions,
+                    pred,
                 ),
-                "r2": r2_score(
+                "R2": r2_score(
                     y.iloc[test_idx],
-                    predictions,
-                ),
-                "base_mae": mean_absolute_error(
-                    y.iloc[test_idx],
-                    baseline,
-                ),
-                "base_r2": r2_score(
-                    y.iloc[test_idx],
-                    baseline,
+                    pred,
                 ),
             }
         )
 
-    return pd.DataFrame(rows)
+    if np.isnan(predictions).any():
+        raise RuntimeError("Some validation samples did not receive predictions.")
 
+    oof = df.copy()
 
-def print_folds(name, folds):
-    """
-    Print per-race validation results and their mean.
-    """
+    oof["Actual"] = y.to_numpy()
 
-    print(f"\n--- {name} (GroupKFold, one whole race held out per fold) ---")
+    oof["Prediction"] = predictions
 
-    print(
-        f"{'held-out race':<28}"
-        f"{'MAE':>8}"
-        f"{'R2':>8}"
-        f"{'base MAE':>10}"
-        f"{'base R2':>9}"
-        f"{'beats?':>8}"
-    )
+    oof["Error"] = (oof["Actual"] - oof["Prediction"]).abs()
 
-    for _, row in folds.iterrows():
-        beats = "yes" if row["mae"] < row["base_mae"] else "NO"
-
-        print(
-            f"{row['race']:<28}"
-            f"{row['mae']:>8.3f}"
-            f"{row['r2']:>8.3f}"
-            f"{row['base_mae']:>10.3f}"
-            f"{row['base_r2']:>9.3f}"
-            f"{beats:>8}"
-        )
-
-    mean_values = folds.mean(numeric_only=True)
-
-    print(
-        f"{'MEAN':<28}"
-        f"{mean_values['mae']:>8.3f}"
-        f"{mean_values['r2']:>8.3f}"
-        f"{mean_values['base_mae']:>10.3f}"
-        f"{mean_values['base_r2']:>9.3f}"
-    )
-
-    print(
-        f"{'std across folds':<28}{folds['mae'].std():>8.3f}{folds['r2'].std():>8.3f}"
-    )
-
-    return mean_values
+    return oof, pd.DataFrame(folds)
 
 
 # =========================================================
-# DEGRADATION PLOT
+
+# VALIDATION RESULTS
+
 # =========================================================
 
 
-def make_plot(df, ridge, compounds):
-    """
-    Create before/after degradation plots.
+def print_results(oof, folds):
 
-    Left:
-        Raw mean pace loss by tyre age.
-
-    Right:
-        Ridge fitted curves with FuelPct and TrackTemp
-        fixed at their dataset means.
-    """
-
-    (
-        fig,
-        (
-            ax_raw,
-            ax_fit,
-        ),
-    ) = plt.subplots(
-        1,
-        2,
-        figsize=(13, 5.5),
-        sharey=True,
+    mae = mean_absolute_error(
+        oof["Actual"],
+        oof["Prediction"],
     )
 
-    # -----------------------------------------------------
-    # BEFORE: raw means
-    # -----------------------------------------------------
-
-    grouped = (
-        df.groupby(["Compound", "TyreLife"])["Delta"]
-        .agg(["mean", "size"])
-        .reset_index()
+    zero_mae = mean_absolute_error(
+        oof["Actual"],
+        np.zeros(len(oof)),
     )
 
-    grouped = grouped[grouped["size"] >= MIN_LAPS]
+    r2 = r2_score(
+        oof["Actual"],
+        oof["Prediction"],
+    )
 
-    for compound, group in grouped.groupby("Compound"):
-        group = group.sort_values("TyreLife")
+    bias = (oof["Prediction"] - oof["Actual"]).mean()
 
-        ax_raw.plot(
-            group["TyreLife"],
-            group["mean"],
-            marker="o",
-            ms=3,
-            label=compound,
+    improvement = (zero_mae - mae) / zero_mae * 100 if zero_mae > 0 else np.nan
+
+    print("\n" + "=" * 75)
+
+    print("RACE-GROUPED MODEL VALIDATION")
+
+    print("=" * 75)
+
+    print(f"Validation samples:    {len(oof):,}")
+
+    print(f"Validation races:      {oof['Race'].nunique()}")
+
+    print(f"Huber MAE:             {mae:.3f} seconds")
+
+    print(f"Zero baseline MAE:     {zero_mae:.3f} seconds")
+
+    print(f"Improvement:           {improvement:+.2f}%")
+
+    print(f"R²:                    {r2:.3f}")
+
+    print(f"Prediction bias:       {bias:+.3f} seconds")
+
+    print("\nFOLD RESULTS")
+
+    print("-" * 75)
+
+    print(folds.to_string(index=False))
+
+    print("\nCOMPOUND RESULTS")
+
+    print("-" * 75)
+
+    for compound, group in oof.groupby("Compound"):
+        compound_mae = mean_absolute_error(
+            group["Actual"],
+            group["Prediction"],
         )
 
-    ax_raw.set_title("BEFORE: Raw pace loss")
+        print(f"{compound:<12}Laps: {len(group):>7,}  MAE: {compound_mae:.3f}s")
 
-    ax_raw.set_xlabel("Tyre age (laps)")
+    print("\nSEASON RESULTS")
 
-    ax_raw.set_ylabel("Pace loss vs driver's best lap (s)")
+    print("-" * 75)
 
-    # -----------------------------------------------------
-    # AFTER: Ridge fitted curves
-    # -----------------------------------------------------
+    for year, group in oof.groupby("Year"):
+        season_mae = mean_absolute_error(
+            group["Actual"],
+            group["Prediction"],
+        )
 
-    mean_row = {
-        "FuelPct": df["FuelPct"].mean(),
-        "TrackTemp": df["TrackTemp"].mean(),
+        print(f"{int(year)}: {len(group):,} samples | MAE: {season_mae:.3f}s")
+
+    if mae < zero_mae:
+        print("\n[PASS] Model beats the zero baseline overall.")
+
+    else:
+        print("\n[FAIL] Model does not beat the zero baseline.")
+
+    return {
+        "mae": mae,
+        "zero_baseline_mae": zero_mae,
+        "improvement": improvement,
+        "r2": r2,
+        "bias": bias,
     }
 
-    for compound in compounds:
-        compound_ages = df.loc[
-            df["Compound"] == compound,
-            "TyreLife",
-        ]
-
-        if compound_ages.empty:
-            continue
-
-        max_age = int(compound_ages.quantile(0.98))
-
-        if max_age < 1:
-            continue
-
-        ages = np.arange(
-            1,
-            max_age + 1,
-        )
-
-        grid = pd.DataFrame(
-            {
-                "TyreLife": ages,
-                "Compound": compound,
-                **mean_row,
-            }
-        )
-
-        predictions = ridge.predict(
-            ridge_design(
-                grid,
-                compounds,
-            )
-        )
-
-        ax_fit.plot(
-            ages,
-            predictions,
-            lw=2,
-            label=compound,
-        )
-
-    ax_fit.set_title("AFTER: Ridge fit, controls held at mean")
-
-    ax_fit.set_xlabel("Tyre age (laps)")
-
-    # -----------------------------------------------------
-    # Common styling
-    # -----------------------------------------------------
-
-    for axis in (
-        ax_raw,
-        ax_fit,
-    ):
-        axis.legend()
-        axis.grid(alpha=0.2)
-
-    fig.suptitle("Tyre degradation before and after fuel correction")
-
-    fig.tight_layout()
-
-    fig.savefig(
-        OUT_PNG,
-        dpi=150,
-        bbox_inches="tight",
-    )
-
-    plt.close(fig)
-
-    print(f"\nsaved {OUT_PNG}")
-
 
 # =========================================================
-# EXPORT CURVE DATA
+
+# COEFFICIENT DIAGNOSTICS
+
 # =========================================================
 
 
-def export_chart_csvs(
-    df,
-    ridge,
+def print_coefficient_diagnostics(
+    model,
     compounds,
+    supported_ages,
 ):
-    """
-    Export raw and fitted degradation curves for
-    dashboard/web visualisation.
-    """
 
-    # -----------------------------------------------------
-    # BEFORE: raw mean values
-    # -----------------------------------------------------
+    huber = model.named_steps["huber"]
 
-    grouped = (
-        df.groupby(["Compound", "TyreLife"])["Delta"]
-        .agg(["mean", "size"])
-        .reset_index()
-    )
+    print("\n" + "=" * 75)
 
-    grouped = grouped[grouped["size"] >= MIN_LAPS]
+    print("LEARNED HUBER DEGRADATION COEFFICIENTS")
 
-    for compound in compounds:
-        data = grouped[grouped["Compound"] == compound][["TyreLife", "mean"]].copy()
+    print("=" * 75)
 
-        data = data.rename(columns={"mean": "PaceLoss"})
+    for name, value in zip(
+        model.feature_names_in_,
+        huber.coef_,
+    ):
+        print(f"{name:<25} {value:+.6f}")
 
-        filename = DATA_DIR / f"before_{compound.lower()}.csv"
+    print("\nMODEL-PREDICTED TYRE AGE CURVES")
 
-        data.to_csv(
-            filename,
-            index=False,
-        )
+    print("Race progress held at 50%.")
 
-        print(f"saved {filename}")
+    print("Predictions are seconds relative to the stint baseline.")
 
-    # -----------------------------------------------------
-    # AFTER: Ridge predictions
-    # -----------------------------------------------------
-
-    mean_row = {
-        "FuelPct": df["FuelPct"].mean(),
-        "TrackTemp": df["TrackTemp"].mean(),
-    }
+    print("-" * 75)
 
     for compound in compounds:
-        compound_ages = df.loc[
-            df["Compound"] == compound,
-            "TyreLife",
-        ]
+        max_age = supported_ages[compound]
 
-        if compound_ages.empty:
-            continue
+        print(f"\n{compound} (supported age up to {max_age:.1f} laps)")
 
-        max_age = int(compound_ages.quantile(0.98))
-
-        if max_age < 1:
-            continue
-
-        ages = np.arange(
-            1,
-            max_age + 1,
-        )
-
-        grid = pd.DataFrame(
-            {
-                "TyreLife": ages,
-                "Compound": compound,
-                **mean_row,
-            }
-        )
-
-        predictions = ridge.predict(
-            ridge_design(
-                grid,
-                compounds,
+        ages = sorted(
+            set(
+                [
+                    0,
+                    5,
+                    10,
+                    15,
+                    20,
+                    25,
+                    int(max_age),
+                ]
             )
         )
 
-        data = pd.DataFrame(
-            {
-                "TyreLife": ages,
-                "PaceLoss": predictions,
+        for age in ages:
+            if age > max_age:
+                continue
+
+            row = {
+                "age_HARD": 0.0,
+                "age2_HARD": 0.0,
+                "age_MEDIUM": 0.0,
+                "age2_MEDIUM": 0.0,
+                "age_SOFT": 0.0,
+                "age2_SOFT": 0.0,
+                "RaceProgress": 0.5,
+                "RaceProgress2": 0.25,
             }
-        )
 
-        filename = DATA_DIR / f"after_{compound.lower()}.csv"
+            row[f"age_{compound}"] = float(age)
 
-        data.to_csv(
-            filename,
-            index=False,
-        )
+            row[f"age2_{compound}"] = float(age**2) / 100.0
 
-        print(f"saved {filename}")
+            feature_row = pd.DataFrame(
+                [row],
+                columns=model.feature_names_in_,
+            )
+
+            prediction = model.predict(feature_row)[0]
+
+            print(f"Tyre age {age:>2}: {prediction:+.3f}s")
 
 
 # =========================================================
+
+# OBSERVED VS PREDICTED BY TYRE AGE
+
+# =========================================================
+
+
+def print_observed_age_comparison(oof):
+
+    print("\n" + "=" * 75)
+
+    print("OBSERVED VS PREDICTED DEGRADATION BY TYRE AGE")
+
+    print("=" * 75)
+
+    bins = [0, 5, 10, 15, 20, 25, 30, 100]
+
+    labels = [
+        "0-4",
+        "5-9",
+        "10-14",
+        "15-19",
+        "20-24",
+        "25-29",
+        "30+",
+    ]
+
+    data = oof.copy()
+
+    data["AgeBand"] = pd.cut(
+        data["StintAge"],
+        bins=bins,
+        labels=labels,
+        right=False,
+    )
+
+    for compound in DRY_COMPOUNDS:
+        group = data[data["Compound"] == compound]
+
+        if group.empty:
+            continue
+
+        print(f"\n{compound}")
+
+        print(f"{'Age':<10}{'Laps':>8}{'Actual':>12}{'Predicted':>13}")
+
+        for age_band, age_group in group.groupby(
+            "AgeBand",
+            observed=True,
+        ):
+            if age_group.empty:
+                continue
+
+            print(
+                f"{str(age_band):<10}"
+                f"{len(age_group):>8,}"
+                f"{age_group['Actual'].mean():>11.3f}s"
+                f"{age_group['Prediction'].mean():>12.3f}s"
+            )
+
+
+# =========================================================
+
+# TRAINING PIPELINE
+
+# =========================================================
+
+
+def train_pace_loss(training_data):
+
+    cleaned = prepare_data(training_data)
+    actual_training_years = sorted(cleaned["Year"].dropna().astype(int).unique().tolist())
+
+    stints = build_stint_targets(cleaned)
+
+    compounds = [
+        compound for compound in DRY_COMPOUNDS if compound in set(stints["Compound"])
+    ]
+
+    if not compounds:
+        raise ValueError("No dry compounds available for training.")
+
+    # -----------------------------------------------------
+
+    # FEATURE ENGINEERING
+
+    # -----------------------------------------------------
+
+    X = build_features(
+        stints,
+        compounds,
+    )
+
+    y = stints["Delta"].astype(float)
+
+    # -----------------------------------------------------
+
+    # SUPPORTED TYRE AGE
+
+    # -----------------------------------------------------
+
+    supported_ages = {}
+
+    for compound in compounds:
+        ages = stints.loc[
+            stints["Compound"] == compound,
+            "StintAge",
+        ]
+
+        supported_ages[compound] = float(
+            ages.quantile(MAX_SUPPORTED_AGE_PERCENTILE / 100)
+        )
+
+    # -----------------------------------------------------
+
+    # CROSS-VALIDATION
+
+    # -----------------------------------------------------
+
+    oof, folds = validate_model(
+        stints,
+        X,
+        y,
+    )
+
+    metrics = print_results(
+        oof,
+        folds,
+    )
+
+    # -----------------------------------------------------
+
+    # FINAL MODEL
+
+    # -----------------------------------------------------
+
+    final_model = make_model()
+
+    final_model.fit(
+        X,
+        y,
+    )
+
+    print_coefficient_diagnostics(
+        final_model,
+        compounds,
+        supported_ages,
+    )
+
+    print_observed_age_comparison(oof)
+
+    print("\n" + "=" * 75)
+
+    print("FINAL HUBER PACE-LOSS MODEL")
+
+    print("=" * 75)
+
+    print(f"Training seasons: {actual_training_years}")
+
+    print(f"Training races:   {stints['Race'].nunique()}")
+
+    print(f"Training samples: {len(stints):,}")
+
+    print(f"Compounds:        {', '.join(compounds)}")
+
+    print("\nSUPPORTED TYRE AGES")
+
+    for compound, age in supported_ages.items():
+        print(f"{compound}: {age:.1f} laps (98th percentile)")
+
+    print("\nModel fitted on all eligible training samples.")
+
+    print("No CSV or plot files created.")
+
+    return {
+        "model": final_model,
+        "compounds": compounds,
+        "feature_columns": X.columns.tolist(),
+        "metrics": metrics,
+        "fold_metrics": folds,
+        "oof_predictions": oof,
+        "training_data": stints,
+        "supported_ages": supported_ages,
+        "training_years": actual_training_years,
+    }
+
+
+# =========================================================
+
 # MAIN
+
 # =========================================================
 
 
 def main():
 
-    # =====================================================
-    # 1. LOAD DATA
-    # =====================================================
+    data = load_training_data()
 
-    if not IN_CSV.exists():
-        raise FileNotFoundError(f"{IN_CSV} not found. Run fetch_data.py first.")
-
-    df = add_features(pd.read_csv(IN_CSV))
-
-    if df.empty:
-        raise RuntimeError(f"{IN_CSV} loaded empty.")
-
-    compounds = sorted(df["Compound"].dropna().unique().tolist())
-
-    print(
-        f"{len(df)} laps, "
-        f"{df['Race'].nunique()} races, "
-        f"compounds: {', '.join(compounds)}"
-    )
-
-    print("laps per compound:\n" + df["Compound"].value_counts().to_string())
-
-    # =====================================================
-    # 2. MODEL MATRICES
-    # =====================================================
-
-    y = df["Delta"]
-
-    X_ridge = ridge_design(
-        df,
-        compounds,
-    )
-
-    tyre_keys = sorted(df["TyreKey"].dropna().unique().tolist())
-
-    print("laps per tyre key:\n" + df["TyreKey"].value_counts().to_string())
-
-    X_ridge_code = ridge_design(
-        df,
-        tyre_keys,
-        key="TyreKey",
-    )
-
-    xgb_input = df[XGB_FEATURES + ["Compound"]]
-
-    X_xgb = pd.get_dummies(
-        xgb_input,
-        columns=["Compound"],
-        dtype=float,
-    )
-
-    # Make sure all required values are valid.
-    for name, X in (
-        ("ridge", X_ridge),
-        ("ridge c-code", X_ridge_code),
-        ("xgb", X_xgb),
-    ):
-        bad_columns = X.columns[X.isna().any()].tolist()
-
-        assert not bad_columns, f"NaNs leaked into {name} features: {bad_columns}"
-
-    assert not y.isna().any(), "NaNs in target Delta"
-
-    # =====================================================
-    # 3. IDENTIFY WET RACES
-    # =====================================================
-
-    per_race = df.groupby("Race").agg(
-        rain=("Rainfall", "mean"),
-        spread=("Delta", "std"),
-        laps=("Delta", "size"),
-    )
-
-    wet = per_race.index[per_race["rain"] > WET_FRACTION].tolist()
-
-    print(f"\n--- per race (wet = rain on >{WET_FRACTION:.0%} of clean laps) ---")
-
-    print(f"{'race':<28}{'laps':>7}{'rain frac':>11}{'Delta std':>11}{'':>6}")
-
-    for race, row in per_race.iterrows():
-        wet_label = "  WET" if race in wet else ""
-
-        print(
-            f"{race:<28}"
-            f"{int(row['laps']):>7}"
-            f"{row['rain']:>11.3f}"
-            f"{row['spread']:>11.3f}"
-            f"{wet_label:>6}"
-        )
-
-    # =====================================================
-    # 4. GROUPED CROSS-VALIDATION
-    # =====================================================
-
-    views = {
-        "pooled": pd.Series(
-            True,
-            index=df.index,
-        ),
-        "dry only": ~df["Race"].isin(wet),
-    }
-
-    means = {}
-
-    for view, mask in views.items():
-        if df.loc[mask, "Race"].nunique() < 2:
-            print(f"\nSkipping {view}: fewer than two race groups.")
-            continue
-
-        for name, X, make_model in (
-            (
-                "Ridge",
-                X_ridge,
-                make_ridge,
-            ),
-            (
-                "Ridge (C-code)",
-                X_ridge_code,
-                make_ridge,
-            ),
-            (
-                "XGBoost",
-                X_xgb,
-                make_xgb,
-            ),
-        ):
-            folds = cv_scores(
-                X[mask.values],
-                y[mask.values],
-                df.loc[
-                    mask.values,
-                    "Race",
-                ],
-                make_model,
-            )
-
-            means[(name, view)] = print_folds(
-                f"{name}, {view}",
-                folds,
-            )
-
-    if ("Ridge", "dry only") in means and ("Ridge (C-code)", "dry only") in means:
-        print(
-            "\ndry-only MAE: "
-            f"Ridge (label) {means[('Ridge', 'dry only')]['mae']:.3f}  vs  "
-            f"Ridge (C-code) {means[('Ridge (C-code)', 'dry only')]['mae']:.3f}"
-        )
-
-    # =====================================================
-    # 5. FULL-DATA RIDGE REFIT
-    # =====================================================
-
-    # CV measures predictive performance.
-    # This full-data refit is used for interpretable
-    # coefficients and fitted degradation curves.
-
-    ridge = make_ridge().fit(
-        X_ridge,
-        y,
-    )
-
-    coef = pd.Series(
-        ridge.coef_,
-        index=X_ridge.columns,
-    )
-
-    # =====================================================
-    # 6. COMPOUND DEGRADATION GRADIENT
-    # =====================================================
-
-    net = {}
-
-    for compound in compounds:
-        compound_ages = df.loc[
-            df["Compound"] == compound,
-            "TyreLife",
-        ]
-
-        if compound_ages.empty:
-            net[compound] = np.nan
-            continue
-
-        hi = compound_ages.quantile(0.98)
-
-        b1 = coef[f"age[{compound}]"]
-
-        b2 = coef[f"age2[{compound}]"]
-
-        if hi <= 1:
-            net[compound] = np.nan
-            continue
-
-        net[compound] = ((b1 * hi + b2 * hi**2 / 100.0) - (b1 + b2 / 100.0)) / (hi - 1)
-
-    print("\n--- Ridge coefficients (full-data refit, quotable) ---")
-
-    print(
-        f"{'compound':<16}"
-        f"{'intercept':>11}"
-        f"{'age s/lap':>12}"
-        f"{'age^2/100':>12}"
-        f"{'net s/lap':>12}"
-    )
-
-    for compound in compounds:
-        print(
-            f"{compound:<16}"
-            f"{coef[f'int[{compound}]']:>11.3f}"
-            f"{coef[f'age[{compound}]']:>12.4f}"
-            f"{coef[f'age2[{compound}]']:>12.4f}"
-            f"{net[compound]:>12.4f}"
-        )
-
-    print(
-        "net s/lap = average gradient of the fitted "
-        "curve over that compound's observed age range"
-    )
-
-    print(
-        f"\nfuel effect  {coef['FuelPct']:+.3f} s across a full tank (FuelPct 1 -> 0)"
-    )
-
-    print(f"track temp   {coef['TrackTemp']:+.4f} s per degC")
-
-    # =====================================================
-    # 7. EXPORT VISUALISATION DATA
-    # =====================================================
-
-    make_plot(
-        df,
-        ridge,
-        compounds,
-    )
-
-    export_chart_csvs(
-        df,
-        ridge,
-        compounds,
-    )
-
-    # =====================================================
-    # 8. SUMMARY
-    # =====================================================
-
-    print("\n" + "=" * 62)
-
-    checks = [
-        (
-            f"rows loaded ({len(df)})",
-            len(df) > 0,
-        ),
-        (
-            "no NaNs in features/target",
-            True,
-        ),
-    ]
-
-    for (name, view), mean_values in means.items():
-        checks.append(
-            (
-                f"{name} {view}: "
-                f"MAE {mean_values['mae']:.3f} "
-                f"< baseline "
-                f"{mean_values['base_mae']:.3f}",
-                mean_values["mae"] < mean_values["base_mae"],
-            )
-        )
-
-    for label, ok in checks:
-        print(f"[{'PASS' if ok else 'FAIL'}] {label}")
-
-    print("=" * 62)
-
-    passed = sum(ok for _, ok in checks)
-
-    print(f"{passed}/{len(checks)} checks passed")
-
-    print(
-        f"caveat: {df['Race'].nunique()} races "
-        "form the CV groups, so per-fold metrics "
-        "are noisy by construction."
-    )
-
-    print(
-        "note: fitted degradation gradients are "
-        "reported as diagnostics, not as a hard "
-        "validation requirement."
-    )
+    return train_pace_loss(data)
 
 
 # =========================================================
+
 # RUN
+
 # =========================================================
 
 if __name__ == "__main__":
-    main()
+    warnings.filterwarnings(
+        "ignore",
+        category=RuntimeWarning,
+    )
+
+    TRAINED_PACE_MODEL = main()

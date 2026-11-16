@@ -1,147 +1,48 @@
 """
-Tier 1 data layer: pull real F1 race laps + weather from FastF1,
-clean them, and save a CSV.
+F1 TYRE STRATEGY — TIF1 DATA COLLECTOR
 
-Run:
-    uv run fetch_data.py
+Training seasons: 2022–2025
+Testing season: 2026
+Data source: tif1 0.11.3
+Output: One Parquet file per successfully processed race.
 """
 
 from pathlib import Path
+import logging
+import json
+import re
+import time
 
-import fastf1
 import pandas as pd
+import tif1
 
 
 # =========================================================
-# PATHS
+# CONFIGURATION
 # =========================================================
 
-HERE = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent
 
-CACHE_DIR = HERE / ".fastf1_cache"
-DATA_DIR = HERE / "data"
+SEASONS = [2022, 2023, 2024, 2025]
 
-OUT_CSV = DATA_DIR / "laps_clean.csv"
+MAX_RACES_PER_RUN = 90
+DELAY_BETWEEN_RACES = 0
 
+# Separate progress file for the new tif1 environment.
+PROGRESS_FILE = BASE_DIR / "tif1_0113_progress.json"
 
-# =========================================================
-# RACES
-# =========================================================
-
-# Add a race = add a line here.
-# Format: (year, event)
-# Event is what fastf1.get_session accepts.
-
-# Since Oct 2026 FastF1 (>= 3.9) needs an F1TV login for timing data,
-# so only races already in .fastf1_cache are usable. The other 2023
-# races and all of 2025 are blocked until a login is configured.
-
-RACES = [
-    (2022, "Bahrain"),
-    (2022, "Spain"),
-    (2022, "Silverstone"),
-    (2022, "Canada"),
-    (2022, "Monza"),
-    (2022, "Suzuka"),
-    # (2022, "Spielberg") excluded: broken source tyre data. 250 of 1,324 laps
-    # have no compound and 298 no tyre age, and FastF1 warns it had to fix
-    # incorrect tyre stint info for this race. Tyre data is what we model.
-    (2022, "Zandvoort"),  # Dutch GP
-    (2024, "Bahrain"),  # dry, hot track
-    (2024, "Spain"),  # dry
-    (2024, "Silverstone"),  # wet/mixed
-    (2024, "Canada"),  # wet/mixed
-    (2023, "Monza"),  # dry, low-degradation
-    (2024, "Monza"),  # dry
-    (2024, "Suzuka"),  # dry
-    (2024, "Spielberg"),  # dry (Austrian GP)
-    (2024, "Zandvoort"),  # dry (Dutch GP)
-]
+# Persistent race data.
+DATA_DIR = BASE_DIR / "training_data_tif1"
+DATA_DIR.mkdir(exist_ok=True)
 
 
-# What fastf1.get_session must resolve each event key to.
-# FastF1's fuzzy matching once silently loaded the wrong race.
-EXPECTED_EVENT_NAMES = {
-    "Bahrain": "Bahrain Grand Prix",
-    "Spain": "Spanish Grand Prix",
-    "Silverstone": "British Grand Prix",
-    "Canada": "Canadian Grand Prix",
-    "Monza": "Italian Grand Prix",
-    "Suzuka": "Japanese Grand Prix",
-    "Spielberg": "Austrian Grand Prix",
-    "Zandvoort": "Dutch Grand Prix",
-}
+logging.getLogger("tif1").setLevel(logging.WARNING)
 
 
 # =========================================================
-# PIRELLI COMPOUND NOMINATIONS
+# REQUIRED COLUMNS
 # =========================================================
 
-# FastF1 only gives weekend-relative labels (SOFT/MEDIUM/HARD).
-# This maps them to the real Pirelli compound for each race.
-# Covers more races than RACES so blocked races can be added later.
-
-PIRELLI_NOMINATIONS = {
-    (2022, "Bahrain"):     {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2022-bahrain-grand-prix.5nQGRrYUMcq8Y2BQeHBTeK
-    (2022, "Spain"):       {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://racingnews365.com/pirelli-confirm-tyre-compound-choices-for-upcoming-races
-    (2022, "Silverstone"): {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2022-british-grand-prix.5NSQn3DvP84qUkQIqltoxd
-    (2022, "Canada"):      {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2022-canadian-grand-prix.3fi2Bwiw5SHQIpsLC5iMNm
-    (2022, "Monza"):       {"HARD": "C2", "MEDIUM": "C3", "SOFT": "C4"},  # https://press.pirelli.com/2022-italian-grand-prix---preview-2/
-    (2022, "Suzuka"):      {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://racingnews365.com/pirelli-confirm-tyre-choices-for-return-of-singapore-and-japan
-    (2022, "Spielberg"):   {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://www.pitpass.com/72881/Pirelli-reveals-compounds-for-Austria-France-and-Hungary
-    (2022, "Zandvoort"):   {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/2022-dutch-grand-prix--preview/
-    (2023, "Bahrain"):     {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/pirelli-confirm-tyre-choices-for-first-three-f1-races-of-2023-as-new.1xlpcTVaLqw0NeM3aYoyCt
-    (2023, "Spain"):       {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/2023-tyre-compound-choices--monaco-and-spain/
-    (2023, "Silverstone"): {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/2023-tyre-compound-choices--canada-austria-and-great-britain/
-    (2023, "Canada"):      {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://press.pirelli.com/2023-tyre-compound-choices--canada-austria-and-great-britain/
-    (2023, "Monza"):       {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://press.pirelli.com/news-and-tyre-choices-for-zandvoort-and-monza/
-    (2023, "Suzuka"):      {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/unchanged-nominations-for-singapore-japan-and-qatar--in-name-at-least/
-    (2023, "Spielberg"):   {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://press.pirelli.com/2023-tyre-compound-choices--canada-austria-and-great-britain/
-    (2023, "Zandvoort"):   {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/news-and-tyre-choices-for-zandvoort-and-monza/
-    (2024, "Bahrain"):     {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/pirelli-nominates-the-compounds-for-the-start-of-2024/
-    (2024, "Spain"):       {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2024-spanish-grand-prix.7rLCqBvroeRw7HVW8GGChP
-    (2024, "Silverstone"): {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2024-british-grand-prix.3vzK0q1kbEOjzwGClOCXoF
-    (2024, "Canada"):      {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://tyrepress.com/2024/04/pirelli-sticks-with-softest-f1-tyre-compound-trio-for-three-more-grands-prix
-    (2024, "Monza"):       {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2024-italian-grand-prix.2oO1jaVl2vB25F16qcFMPH
-    (2024, "Suzuka"):      {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2024-japanese-grand-prix.0dan38YDF6LLdAHyNuhJX
-    (2024, "Spielberg"):   {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2024-austrian-grand-prix.501nkNqLI40inoC4Tdf4w6
-    (2024, "Zandvoort"):   {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/all-compounds-on-track-over-next-three-races/
-    (2025, "Bahrain"):     {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2025-bahrain-grand-prix.7gnHbNpm0OJQIjPqsWoyof
-    (2025, "Spain"):       {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://press.pirelli.com/from-monaco-to-montreal-all-the-compounds-in-play/
-    (2025, "Silverstone"): {"HARD": "C2", "MEDIUM": "C3", "SOFT": "C4"},  # https://press.pirelli.com/both-new-and-familiar-for-spielberg-to-budapest/
-    (2025, "Canada"):      {"HARD": "C4", "MEDIUM": "C5", "SOFT": "C6"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2025-canadian-grand-prix.6f3pKs15OHHlxe7uI544kO
-    (2025, "Monza"):       {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://www.formula1.com/en/latest/article/what-tyres-will-the-teams-and-drivers-have-for-the-2025-italian-grand-prix.7fO9Z1g1aG6QUGhXzg8gLU
-    (2025, "Suzuka"):      {"HARD": "C1", "MEDIUM": "C2", "SOFT": "C3"},  # https://scuderiafans.com/pirelli-reveals-tire-compounds-for-first-five-races-of-2025-f1-season/
-    (2025, "Spielberg"):   {"HARD": "C3", "MEDIUM": "C4", "SOFT": "C5"},  # https://press.pirelli.com/both-new-and-familiar-for-spielberg-to-budapest/
-    (2025, "Zandvoort"):   {"HARD": "C2", "MEDIUM": "C3", "SOFT": "C4"},  # https://www.pitpass.com/80783/Pirelli-reveals-compounds-for-remaining-races
-}
-
-
-def compound_code(year, event, compound):
-    """
-    Return a Pirelli code comparable across years ("C0".."C6"),
-    or None for INTERMEDIATE/WET or an unknown race.
-    """
-
-    code = PIRELLI_NOMINATIONS.get((year, event), {}).get(compound)
-
-    if code is None:
-        return None
-
-    # In 2023 Pirelli renamed the old C1 to C0 (a new C1 sits between them).
-    if year == 2022 and code == "C1":
-        return "C0"
-
-    # ponytail: 2025 also changed compounds; no 2025 race is in RACES yet,
-    # so 2025 codes may need their own mapping when those races are added.
-    return code
-
-
-# =========================================================
-# COLUMNS
-# =========================================================
-
-# Lap-level columns worth keeping downstream.
 LAP_COLS = [
     "Driver",
     "DriverNumber",
@@ -157,7 +58,6 @@ LAP_COLS = [
     "LapStartTime",
 ]
 
-# Weather columns worth keeping downstream.
 WEATHER_COLS = [
     "AirTemp",
     "TrackTemp",
@@ -170,153 +70,398 @@ WEATHER_COLS = [
 
 
 # =========================================================
+# DATA CLEANING
+# =========================================================
+
+
+def clean_race_laps(laps, year, round_number, event):
+
+    laps = laps.copy()
+
+    missing = [column for column in LAP_COLS if column not in laps.columns]
+
+    if missing:
+        raise ValueError(f"Required columns missing: {missing}")
+
+    for column in WEATHER_COLS:
+        if column not in laps.columns:
+            laps[column] = pd.NA
+
+    raw_count = len(laps)
+
+    # Accurate laps only.
+    laps = laps[laps["IsAccurate"] == True].copy()
+    after_accuracy = len(laps)
+
+    # Green flag only.
+    laps = laps[laps["TrackStatus"].astype(str) == "1"].copy()
+
+    after_green = len(laps)
+
+    if laps.empty:
+        raise ValueError("No laps survived accuracy and track-status filters.")
+
+    # Convert lap time to seconds.
+    if "LapTimeSeconds" in laps.columns:
+        laps["LapTimeSeconds"] = pd.to_numeric(
+            laps["LapTimeSeconds"],
+            errors="coerce",
+        )
+    else:
+        laps["LapTimeSeconds"] = pd.to_timedelta(
+            laps["LapTime"], errors="coerce"
+        ).dt.total_seconds()
+
+    laps = laps.dropna(subset=["LapTimeSeconds", "Compound", "TyreLife"]).copy()
+
+    if laps.empty:
+        raise ValueError("No laps with valid lap time and tyre data.")
+
+    # Remove extremely slow laps.
+    median = laps["LapTimeSeconds"].median()
+
+    laps = laps[laps["LapTimeSeconds"] < 1.05 * median].copy()
+
+    # Normalize compound names.
+    laps["Compound"] = laps["Compound"].astype(str).str.upper()
+
+    # Keep dry compounds.
+    laps = laps[laps["Compound"].isin(["HARD", "MEDIUM", "SOFT"])].copy()
+
+    if laps.empty:
+        raise ValueError("No usable HARD, MEDIUM or SOFT laps.")
+
+    keep = list(dict.fromkeys(LAP_COLS + WEATHER_COLS + ["LapTimeSeconds"]))
+
+    laps = laps[keep].copy()
+
+    laps.insert(0, "Event", event)
+    laps.insert(0, "Round", round_number)
+    laps.insert(0, "Year", year)
+
+    stats = {
+        "year": year,
+        "round": round_number,
+        "event": event,
+        "raw": raw_count,
+        "accurate": after_accuracy,
+        "green": after_green,
+        "usable": len(laps),
+    }
+
+    return laps, stats
+
+
+# =========================================================
 # LOAD ONE RACE
 # =========================================================
 
 
-def load_race(year, event):
-    """
-    Return one race's cleaned laps with weather merged on.
+def load_race(year, round_number, expected_event):
 
-    Also returns:
-        (resolved_event, raw, after_f1, after_f2, after_f3)
-    """
-
-    # -----------------------------------------------------
-    # Load FastF1 race session
-    # -----------------------------------------------------
-
-    session = fastf1.get_session(year, event, "R")
-
-    session.load(telemetry=False, messages=False)
+    # Use the official calendar round number.
+    session = tif1.get_session(
+        year,
+        int(round_number),
+        "Race",
+    )
 
     laps = session.laps.copy()
 
-    raw = len(laps)
+    if laps.empty:
+        raise ValueError("No lap data returned.")
 
-    # -----------------------------------------------------
-    # Check required lap columns
-    # -----------------------------------------------------
+    # tif1 0.11.3 uses nested session metadata.
+    info = session.session_info
 
-    missing_lap = [column for column in LAP_COLS if column not in laps.columns]
+    if not isinstance(info, dict):
+        raise ValueError("Invalid session metadata.")
 
-    if missing_lap:
-        print(f"  !! missing lap columns: {missing_lap}")
+    meeting = info.get("Meeting", {})
 
-    # -----------------------------------------------------
-    # Check required weather columns
-    # -----------------------------------------------------
+    if not isinstance(meeting, dict):
+        raise ValueError("Missing meeting metadata.")
 
-    weather_source = session.weather_data.copy()
+    resolved_event = meeting.get("Name")
 
-    missing_weather = [
-        column for column in WEATHER_COLS if column not in weather_source.columns
-    ]
+    if not resolved_event:
+        raise ValueError("Could not verify returned event name.")
 
-    if missing_weather:
-        print(f"  !! missing weather columns: {missing_weather}")
+    resolved_event = str(resolved_event).strip()
+    expected_event = str(expected_event).strip()
 
-    # -----------------------------------------------------
-    # Keep only available weather columns
-    # -----------------------------------------------------
-
-    available_weather = [
-        column for column in WEATHER_COLS if column in weather_source.columns
-    ]
-
-    weather = weather_source[["Time"] + available_weather].sort_values("Time")
-
-    # -----------------------------------------------------
-    # Sort laps by lap start time
-    # -----------------------------------------------------
-
-    laps = laps.sort_values("LapStartTime")
-
-    # -----------------------------------------------------
-    # Merge weather using nearest timestamp
-    #
-    # Weather is sampled approximately once per minute,
-    # while laps occur roughly once every 90 seconds.
-    # Therefore this is a nearest-time merge.
-    # -----------------------------------------------------
-
-    laps = pd.merge_asof(
-        laps, weather, left_on="LapStartTime", right_on="Time", direction="nearest"
-    )
-
-    # -----------------------------------------------------
-    # Filter 1:
-    # FastF1's own lap-integrity flag
-    # -----------------------------------------------------
-
-    laps = laps[laps["IsAccurate"]]
-
-    after_f1 = len(laps)
-
-    # -----------------------------------------------------
-    # Filter 2:
-    # Green flag only
-    #
-    # Drops Safety Car / VSC laps.
-    # -----------------------------------------------------
-
-    laps = laps[laps["TrackStatus"] == "1"]
-
-    after_f2 = len(laps)
-
-    # -----------------------------------------------------
-    # Filter 3:
-    # Remove unusually slow laps
-    #
-    # Keep laps below 1.05 × race median.
-    # This reduces traffic, in-lap and out-lap effects.
-    # -----------------------------------------------------
-
-    median = laps["LapTime"].median()
-
-    laps = laps[laps["LapTime"] < 1.05 * median]
-
-    # Laps without a compound or tyre age can't be used by any tyre model.
-    laps = laps.dropna(subset=["Compound", "TyreLife"])
-
-    after_f3 = len(laps)
-
-    # -----------------------------------------------------
-    # Keep required columns that actually exist
-    # -----------------------------------------------------
-
-    available_lap_cols = [column for column in LAP_COLS if column in laps.columns]
-
-    laps = laps[available_lap_cols + available_weather].copy()
-
-    # -----------------------------------------------------
-    # Convert lap time to seconds
-    # -----------------------------------------------------
-
-    laps["LapTimeSeconds"] = laps["LapTime"].dt.total_seconds()
-
-    # -----------------------------------------------------
-    # Use the event name resolved by FastF1
-    # -----------------------------------------------------
-
-    resolved = session.event["EventName"]
-
-    expected = EXPECTED_EVENT_NAMES[event]
-
-    if resolved != expected:
+    if resolved_event.casefold() != expected_event.casefold():
         raise ValueError(
-            f"FastF1 resolved {year} {event!r} to {resolved!r}, expected {expected!r}"
+            f"Event mismatch: expected '{expected_event}', received '{resolved_event}'."
         )
 
-    laps.insert(0, "Event", resolved)
+    cleaned, stats = clean_race_laps(
+        laps,
+        year,
+        round_number,
+        resolved_event,
+    )
 
-    laps.insert(0, "Year", year)
+    return cleaned, stats
 
-    laps["CCode"] = [
-        compound_code(year, event, compound) for compound in laps["Compound"]
+
+# =========================================================
+# EVENT SCHEDULES
+# =========================================================
+
+
+def get_race_candidates():
+
+    candidates = []
+
+    for year in SEASONS:
+        print(f"\nReading {year} event schedule...")
+
+        schedule = tif1.get_events(year)
+
+        if not isinstance(schedule, pd.DataFrame):
+            schedule = pd.DataFrame(schedule)
+
+        required = ["RoundNumber", "EventName"]
+
+        missing = [column for column in required if column not in schedule.columns]
+
+        if missing:
+            raise ValueError(f"{year} schedule missing columns: {missing}")
+
+        schedule = schedule.copy()
+
+        schedule["RoundNumber"] = pd.to_numeric(
+            schedule["RoundNumber"],
+            errors="coerce",
+        )
+
+        schedule = schedule[schedule["RoundNumber"] > 0]
+
+        for _, row in schedule.iterrows():
+            candidates.append(
+                (
+                    year,
+                    int(row["RoundNumber"]),
+                    str(row["EventName"]).strip(),
+                )
+            )
+
+        print(f"Race candidates: {len(schedule)}")
+
+    return candidates
+
+
+# =========================================================
+# PROGRESS TRACKING
+# =========================================================
+
+
+def load_completed_races():
+
+    if not PROGRESS_FILE.exists():
+        return set()
+
+    try:
+        data = json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
+
+        return set(data.get("completed", []))
+
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+
+def save_completed_races(completed):
+
+    data = {"completed": sorted(completed)}
+
+    temp_file = PROGRESS_FILE.with_suffix(".tmp")
+
+    temp_file.write_text(
+        json.dumps(data, indent=2),
+        encoding="utf-8",
+    )
+
+    temp_file.replace(PROGRESS_FILE)
+
+
+# =========================================================
+# PARQUET STORAGE
+# =========================================================
+
+
+def get_output_path(year, round_number, event):
+
+    slug = (
+        re.sub(
+            r"[^a-zA-Z0-9]+",
+            "_",
+            event,
+        )
+        .strip("_")
+        .lower()
+    )
+
+    filename = f"{year}_R{round_number:02d}_{slug}.parquet"
+
+    return DATA_DIR / filename
+
+
+def save_race_data(laps, year, round_number, event):
+
+    output_path = get_output_path(
+        year,
+        round_number,
+        event,
+    )
+
+    laps.to_parquet(
+        output_path,
+        index=False,
+        engine="pyarrow",
+    )
+
+    # Verify that the saved file can be read.
+    verification = pd.read_parquet(output_path)
+
+    if len(verification) != len(laps):
+        raise ValueError("Parquet verification failed.")
+
+    return output_path
+
+
+# =========================================================
+# LOAD TRAINING BATCH
+# =========================================================
+
+
+def load_training_data():
+
+    candidates = get_race_candidates()
+    completed = load_completed_races()
+
+    pending = [
+        (year, round_number, event)
+        for year, round_number, event in candidates
+        if f"{year}|{event}" not in completed
     ]
 
-    return (laps, (resolved, raw, after_f1, after_f2, after_f3))
+    print("\n" + "=" * 70)
+    print("TIF1 0.11.3 TRAINING DATA COLLECTION")
+    print("=" * 70)
+
+    print(f"Total candidates: {len(candidates)}")
+    print(f"Already completed: {len(completed)}")
+    print(f"Remaining: {len(pending)}")
+
+    selected = pending[:MAX_RACES_PER_RUN]
+
+    frames = []
+    stats = []
+    unavailable = []
+
+    for index, (year, round_number, event) in enumerate(
+        selected,
+        start=1,
+    ):
+        print(
+            f"\n[{index}/{len(selected)}] {year} — Round {round_number}: {event}",
+            flush=True,
+        )
+
+        try:
+            laps, race_stats = load_race(
+                year,
+                round_number,
+                event,
+            )
+
+            output_path = save_race_data(
+                laps,
+                year,
+                round_number,
+                event,
+            )
+
+            # Mark completed only after successful saving.
+            completed.add(f"{year}|{event}")
+            save_completed_races(completed)
+
+            frames.append(laps)
+            stats.append(race_stats)
+
+            print(f"[PASS] {len(laps):,} usable laps")
+            print(f"[SAVED] {output_path.name}")
+
+        except Exception as error:
+            unavailable.append((year, event, str(error)))
+
+            print(f"[FAILED] {error}")
+
+        if index < len(selected):
+            time.sleep(DELAY_BETWEEN_RACES)
+
+    print(f"\nProgress: {len(completed)}/{len(candidates)} races completed.")
+
+    if not frames:
+        print("\nNo new race data was collected.")
+        return None, stats, unavailable
+
+    combined = pd.concat(
+        frames,
+        ignore_index=True,
+    )
+
+    combined = combined.sort_values(
+        ["Year", "Round", "Driver", "LapNumber"]
+    ).reset_index(drop=True)
+
+    return combined, stats, unavailable
+
+
+# =========================================================
+# SUMMARY
+# =========================================================
+
+
+def print_summary(combined, stats, unavailable):
+
+    print("\n" + "=" * 70)
+    print("F1 TYRE STRATEGY — DATA COLLECTION SUMMARY")
+    print("=" * 70)
+
+    print(f"{'YEAR':<8}{'RACE':<35}{'USABLE LAPS':>15}")
+    print("-" * 70)
+
+    for item in stats:
+        print(f"{item['year']:<8}{item['event']:<35}{item['usable']:>15,}")
+
+    print("-" * 70)
+
+    print(f"Races loaded: {len(stats)}")
+    print(f"Races failed: {len(unavailable)}")
+    print(f"Total usable laps: {len(combined):,}")
+
+    print("\nCOMPOUND COUNTS")
+    print(combined["Compound"].value_counts().to_string())
+
+    print("\nWEATHER COVERAGE")
+
+    for column in ["Rainfall", "TrackTemp"]:
+        missing = combined[column].isna().sum()
+
+        print(f"{column}: {len(combined) - missing:,} available | {missing:,} missing")
+
+    if unavailable:
+        print("\nFAILED RACES")
+
+        for year, event, reason in unavailable:
+            print(f"{year} — {event}: {reason}")
+
+    print("\n" + "=" * 70)
+    print(f"Parquet files stored in: {DATA_DIR}")
+    print("No CSV or plot files created.")
+    print("=" * 70)
 
 
 # =========================================================
@@ -326,153 +471,20 @@ def load_race(year, event):
 
 def main():
 
-    # -----------------------------------------------------
-    # Create required directories
-    # -----------------------------------------------------
+    combined, stats, unavailable = load_training_data()
 
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if combined is None:
+        print("No new data collected in this batch.")
+        return None
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    # -----------------------------------------------------
-    # Enable FastF1 cache
-    # -----------------------------------------------------
-
-    fastf1.Cache.enable_cache(str(CACHE_DIR))
-
-    missing_nominations = [race for race in RACES if race not in PIRELLI_NOMINATIONS]
-
-    assert not missing_nominations, (
-        f"RACES without a PIRELLI_NOMINATIONS entry: {missing_nominations}"
+    print_summary(
+        combined,
+        stats,
+        unavailable,
     )
 
-    assert compound_code(2022, "Bahrain", "HARD") == "C0"  # old C1 renamed
-    assert compound_code(2024, "Bahrain", "HARD") == "C1"
-    assert compound_code(2024, "Bahrain", "INTERMEDIATE") is None
+    return combined
 
-    frames = []
-    stats = []
-
-    # -----------------------------------------------------
-    # Process every race
-    # -----------------------------------------------------
-
-    for year, event in RACES:
-        print(f"\n=== {year} {event} ===")
-
-        laps, counts = load_race(year, event)
-
-        frames.append(laps)
-
-        stats.append((year, *counts))
-
-    # -----------------------------------------------------
-    # Combine all races
-    # -----------------------------------------------------
-
-    if not frames:
-        raise RuntimeError("No race data was loaded.")
-
-    combined = pd.concat(frames, ignore_index=True)
-
-    # -----------------------------------------------------
-    # Save cleaned dataset
-    # -----------------------------------------------------
-
-    combined.to_csv(OUT_CSV, index=False)
-
-    # =====================================================
-    # SELF-CHECK SUMMARY
-    # =====================================================
-
-    print("\n" + "=" * 78)
-
-    print(
-        f"{'race (as resolved)':<32}"
-        f"{'raw':>7}"
-        f"{'IsAcc':>8}"
-        f"{'green':>8}"
-        f"{'<1.05x':>8}"
-        f"{'survived':>10}"
-    )
-
-    print("-" * 78)
-
-    total = [0, 0, 0, 0]
-
-    for year, event, raw, f1_count, f2, f3 in stats:
-        flag = "  <-- ZERO LAPS" if f3 == 0 else ""
-
-        survival_rate = f3 / raw if raw > 0 else 0
-
-        print(
-            f"{f'{year} {event}':<32}"
-            f"{raw:>7}"
-            f"{f1_count:>8}"
-            f"{f2:>8}"
-            f"{f3:>8}"
-            f"{survival_rate:>9.0%}"
-            f"{flag}"
-        )
-
-        total = [a + b for a, b in zip(total, (raw, f1_count, f2, f3))]
-
-    print("-" * 78)
-
-    raw, f1_count, f2, f3 = total
-
-    total_survival = f3 / raw if raw > 0 else 0
-
-    print(f"{'TOTAL':<32}{raw:>7}{f1_count:>8}{f2:>8}{f3:>8}{total_survival:>9.0%}")
-
-    # -----------------------------------------------------
-    # Filter summary
-    # -----------------------------------------------------
-
-    filter12_rate = f2 / raw if raw > 0 else 0
-
-    print(
-        f"\nfilters 1+2 kept "
-        f"{filter12_rate:.1%} of raw laps "
-        f"(doc expects roughly 85-90%)"
-    )
-
-    print(f"final: {len(combined)} rows x {len(combined.columns)} cols -> {OUT_CSV}")
-
-    # -----------------------------------------------------
-    # Compound counts
-    # -----------------------------------------------------
-
-    print("compound counts:\n", combined["Compound"].value_counts().to_string())
-
-    # =====================================================
-    # VALIDATION
-    # =====================================================
-
-    needed = [
-        "Compound",
-        "CCode",
-        "TyreLife",
-        "LapTimeSeconds",
-        "Driver",
-        "Year",
-        "Event",
-    ]
-
-    assert not combined.empty, "no laps survived across all races"
-
-    missing_required = [column for column in needed if column not in combined.columns]
-
-    assert not missing_required, f"missing required columns: {missing_required}"
-
-    race_sizes = combined.groupby(["Year", "Event"]).size()
-
-    assert not race_sizes.empty and race_sizes.min() > 0, "a race contributed zero laps"
-
-
-# =========================================================
-# RUN
-# =========================================================
 
 if __name__ == "__main__":
-    main()
+    TRAINING_DATA = main()
